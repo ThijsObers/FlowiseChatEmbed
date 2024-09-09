@@ -1,35 +1,52 @@
 import { createSignal, createEffect, For, onMount, Show, mergeProps, on, createMemo } from 'solid-js';
 import { v4 as uuidv4 } from 'uuid';
-import { sendMessageQuery, isStreamAvailableQuery, IncomingInput, getChatbotConfig } from '@/queries/sendMessageQuery';
+import {
+  sendMessageQuery,
+  upsertVectorStoreWithFormData,
+  isStreamAvailableQuery,
+  IncomingInput,
+  getChatbotConfig,
+  FeedbackRatingType,
+} from '@/queries/sendMessageQuery';
 import { TextInput } from './inputs/textInput';
 import { GuestBubble } from './bubbles/GuestBubble';
 import { BotBubble } from './bubbles/BotBubble';
 import { LoadingBubble } from './bubbles/LoadingBubble';
 import { SourceBubble } from './bubbles/SourceBubble';
 import { StarterPromptBubble } from './bubbles/StarterPromptBubble';
-import { BotMessageTheme, TextInputTheme, UserMessageTheme, FeedbackTheme } from '@/features/bubble/types';
+import { BotMessageTheme, FooterTheme, TextInputTheme, UserMessageTheme, FeedbackTheme } from '@/features/bubble/types';
 import { Badge } from './Badge';
 import socketIOClient from 'socket.io-client';
 import { Popup } from '@/features/popup';
 import { Avatar } from '@/components/avatars/Avatar';
 import { DeleteButton, SendButton } from '@/components/buttons/SendButton';
+import { FilePreview } from '@/components/inputs/textInput/components/FilePreview';
 import { CircleDotIcon, TrashIcon } from './icons';
 import { CancelButton } from './buttons/CancelButton';
 import { cancelAudioRecording, startAudioRecording, stopAudioRecording } from '@/utils/audioRecording';
+import { LeadCaptureBubble } from '@/components/bubbles/LeadCaptureBubble';
+import { removeLocalStorageChatHistory, getLocalStorageChatflow, setLocalStorageChatflow } from '@/utils';
 
 export type FileEvent<T = EventTarget> = {
   target: T;
 };
 
-type ImageUploadConstraits = {
+export type FormEvent<T = EventTarget> = {
+  preventDefault: () => void;
+  currentTarget: T;
+};
+
+type IUploadConstraits = {
   fileTypes: string[];
   maxUploadSize: number;
 };
 
 export type UploadsConfig = {
-  imgUploadSizeAndTypes: ImageUploadConstraits[];
+  imgUploadSizeAndTypes: IUploadConstraits[];
+  fileUploadSizeAndTypes: IUploadConstraits[];
   isImageUploadAllowed: boolean;
   isSpeechToTextEnabled: boolean;
+  isFileUploadAllowed: boolean;
 };
 
 type FilePreviewData = string | ArrayBuffer;
@@ -42,7 +59,29 @@ type FilePreview = {
   type: string;
 };
 
-type messageType = 'apiMessage' | 'userMessage' | 'usermessagewaiting';
+type messageType = 'apiMessage' | 'userMessage' | 'usermessagewaiting' | 'leadCaptureMessage';
+
+export type IAgentReasoning = {
+  agentName?: string;
+  messages?: string[];
+  usedTools?: any[];
+  sourceDocuments?: any[];
+  instructions?: string;
+  nextAgent?: string;
+};
+
+export type IAction = {
+  id?: string;
+  elements?: Array<{
+    type: string;
+    label: string;
+  }>;
+  mapping?: {
+    approve: string;
+    reject: string;
+    toolCalls: any[];
+  };
+};
 
 export type FileUpload = Omit<FilePreview, 'preview'>;
 
@@ -53,6 +92,9 @@ export type MessageType = {
   sourceDocuments?: any;
   fileAnnotations?: any;
   fileUploads?: Partial<FileUpload>[];
+  agentReasoning?: IAgentReasoning[];
+  action?: IAction | null;
+  rating?: FeedbackRatingType;
 };
 
 type observerConfigType = (accessor: string | boolean | object | MessageType[]) => void;
@@ -61,6 +103,7 @@ export type observersConfigType = Record<'observeUserInput' | 'observeLoading' |
 export type BotProps = {
   chatflowid: string;
   apiHost?: string;
+  onRequest?: (request: RequestInit) => Promise<void>;
   chatflowConfig?: Record<string, unknown>;
   welcomeMessage?: string;
   errorMessage?: string;
@@ -73,11 +116,25 @@ export type BotProps = {
   bubbleBackgroundColor?: string;
   bubbleTextColor?: string;
   showTitle?: boolean;
+  showAgentMessages?: boolean;
   title?: string;
   titleAvatarSrc?: string;
   fontSize?: number;
   isFullPage?: boolean;
+  footer?: FooterTheme;
   observersConfig?: observersConfigType;
+  starterPrompts?: string[];
+  starterPromptFontSize?: number;
+  clearChatOnReload?: boolean;
+};
+
+export type LeadsConfig = {
+  status: boolean;
+  title?: string;
+  name?: boolean;
+  email?: boolean;
+  phone?: boolean;
+  successMessage?: string;
 };
 
 const defaultWelcomeMessage = 'Hi there! How can I help?';
@@ -182,6 +239,7 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
     ],
     { equals: false },
   );
+
   const [socketIOClientId, setSocketIOClientId] = createSignal('');
   const [isChatFlowAvailableToStream, setIsChatFlowAvailableToStream] = createSignal(false);
   const [chatId, setChatId] = createSignal(
@@ -190,6 +248,9 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
   const [starterPrompts, setStarterPrompts] = createSignal<string[]>([], { equals: false });
   const [chatFeedbackStatus, setChatFeedbackStatus] = createSignal<boolean>(false);
   const [uploadsConfig, setUploadsConfig] = createSignal<UploadsConfig>();
+  const [leadsConfig, setLeadsConfig] = createSignal<LeadsConfig>();
+  const [isLeadSaved, setIsLeadSaved] = createSignal(false);
+  const [leadEmail, setLeadEmail] = createSignal('');
 
   // drag & drop file input
   // TODO: fix this type
@@ -203,6 +264,7 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
 
   // drag & drop
   const [isDragActive, setIsDragActive] = createSignal(false);
+  const [uploadedFiles, setUploadedFiles] = createSignal<File[]>([]);
 
   onMount(() => {
     if (botProps?.observersConfig) {
@@ -240,14 +302,73 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
    * Add each chat message into localStorage
    */
   const addChatMessage = (allMessage: MessageType[]) => {
-    localStorage.setItem(`${props.chatflowid}_EXTERNAL`, JSON.stringify({ chatId: chatId(), chatHistory: allMessage }));
+    const messages = allMessage.map((item) => {
+      if (item.fileUploads) {
+        const fileUploads = item?.fileUploads.map((file) => ({
+          type: file.type,
+          name: file.name,
+          mime: file.mime,
+        }));
+        return { ...item, fileUploads };
+      }
+      return item;
+    });
+    setLocalStorageChatflow(props.chatflowid, chatId(), { chatHistory: messages });
   };
 
-  const updateLastMessage = (text: string, messageId: string, sourceDocuments: any = null, fileAnnotations: any = null) => {
+  // Define the audioRef
+  let audioRef: HTMLAudioElement | undefined;
+  // CDN link for default receive sound
+  const defaultReceiveSound = 'https://cdn.jsdelivr.net/gh/FlowiseAI/FlowiseChatEmbed@latest/src/assets/receive_message.mp3';
+  const playReceiveSound = () => {
+    if (props.textInput?.receiveMessageSound) {
+      let audioSrc = defaultReceiveSound;
+      if (props.textInput?.receiveSoundLocation) {
+        audioSrc = props.textInput?.receiveSoundLocation;
+      }
+      audioRef = new Audio(audioSrc);
+      audioRef.play();
+    }
+  };
+
+  let hasSoundPlayed = false;
+  // TODO: this has the bug where first message is not showing: https://github.com/FlowiseAI/FlowiseChatEmbed/issues/158
+  // The solution is to use SSE
+  const updateLastMessage = (
+    text: string,
+    messageId: string,
+    sourceDocuments: any,
+    fileAnnotations: any,
+    agentReasoning: IAgentReasoning[] = [],
+    action: IAction,
+    resultText: string,
+  ) => {
     setMessages((data) => {
       const updated = data.map((item, i) => {
         if (i === data.length - 1) {
-          return { ...item, message: item.message + text, messageId, sourceDocuments, fileAnnotations };
+          if (resultText && !hasSoundPlayed) {
+            playReceiveSound();
+            hasSoundPlayed = true;
+          }
+          return { ...item, message: item.message + text, messageId, sourceDocuments, fileAnnotations, agentReasoning, action };
+        }
+        return item;
+      });
+      addChatMessage(updated);
+      return [...updated];
+    });
+
+    // Set hasSoundPlayed to false if resultText exists
+    if (resultText) {
+      hasSoundPlayed = false;
+    }
+  };
+
+  const updateLastMessageSourceDocuments = (sourceDocuments: any) => {
+    setMessages((data) => {
+      const updated = data.map((item, i) => {
+        if (i === data.length - 1) {
+          return { ...item, sourceDocuments };
         }
         return item;
       });
@@ -256,11 +377,24 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
     });
   };
 
-  const updateLastMessageSourceDocuments = (sourceDocuments: any) => {
+  const updateLastMessageAgentReasoning = (agentReasoning: string | IAgentReasoning[]) => {
     setMessages((data) => {
       const updated = data.map((item, i) => {
         if (i === data.length - 1) {
-          return { ...item, sourceDocuments: sourceDocuments };
+          return { ...item, agentReasoning: typeof agentReasoning === 'string' ? JSON.parse(agentReasoning) : agentReasoning };
+        }
+        return item;
+      });
+      addChatMessage(updated);
+      return [...updated];
+    });
+  };
+
+  const updateLastMessageAction = (action: IAction) => {
+    setMessages((data) => {
+      const updated = data.map((item, i) => {
+        if (i === data.length - 1) {
+          return { ...item, action: typeof action === 'string' ? JSON.parse(action) : action };
         }
         return item;
       });
@@ -284,6 +418,7 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
     });
     setLoading(false);
     setUserInput('');
+    setUploadedFiles([]);
     scrollToBottom();
   };
 
@@ -292,12 +427,11 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
   };
 
   // Handle form submission
-  const handleSubmit = async (value: string) => {
+  const handleSubmit = async (value: string, action?: IAction | undefined | null) => {
     setUserInput(value);
-
     if (value.trim() === '') {
-      const containsAudio = previews().filter((item) => item.type === 'audio').length > 0;
-      if (!(previews().length >= 1 && containsAudio)) {
+      const containsFile = previews().filter((item) => !item.mime.startsWith('image') && item.type !== 'audio').length > 0;
+      if (!previews().length || (previews().length && containsFile)) {
         return;
       }
     }
@@ -305,11 +439,7 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
     setLoading(true);
     scrollToBottom();
 
-    // Send user question and history to API
-    const welcomeMessage = props.welcomeMessage ?? defaultWelcomeMessage;
-    const messageList = messages().filter((msg) => msg.message !== welcomeMessage);
-
-    const urls = previews().map((item) => {
+    const uploads = previews().map((item) => {
       return {
         data: item.data,
         type: item.type,
@@ -321,20 +451,23 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
     clearPreviews();
 
     setMessages((prevMessages) => {
-      const messages: MessageType[] = [...prevMessages, { message: value, type: 'userMessage', fileUploads: urls }];
+      const messages: MessageType[] = [...prevMessages, { message: value, type: 'userMessage', fileUploads: uploads }];
       addChatMessage(messages);
       return messages;
     });
 
     const body: IncomingInput = {
       question: value,
-      history: messageList,
       chatId: chatId(),
     };
 
-    if (urls && urls.length > 0) body.uploads = urls;
+    if (uploads && uploads.length > 0) body.uploads = uploads;
 
     if (props.chatflowConfig) body.overrideConfig = props.chatflowConfig;
+
+    if (leadEmail()) body.leadEmail = leadEmail();
+
+    if (action) body.action = action;
 
     if (isChatFlowAvailableToStream()) {
       body.socketIOClientId = socketIOClientId();
@@ -342,10 +475,34 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
       setMessages((prevMessages) => [...prevMessages, { message: '', type: 'apiMessage' }]);
     }
 
+    if (uploadedFiles().length > 0) {
+      const formData = new FormData();
+      for (const file of uploadedFiles()) {
+        formData.append('files', file);
+      }
+      formData.append('chatId', chatId());
+
+      const response = await upsertVectorStoreWithFormData({
+        chatflowid: props.chatflowid,
+        apiHost: props.apiHost,
+        formData: formData,
+      });
+      if (!response.data) {
+        setMessages((prevMessages) => [...prevMessages, { message: 'Unable to upload documents', type: 'apiMessage' }]);
+      } else {
+        // delay for vector store to be updated
+        const delay = (delayInms: number) => {
+          return new Promise((resolve) => setTimeout(resolve, delayInms));
+        };
+        await delay(2500); //TODO: check if embeddings can be retrieved using file name as metadata filter
+      }
+    }
+
     const result = await sendMessageQuery({
       chatflowid: props.chatflowid,
       apiHost: props.apiHost,
       body,
+      onRequest: props.onRequest,
     });
 
     if (result.data) {
@@ -363,7 +520,7 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
           return [...messages];
         });
       }
-      if (urls && urls.length > 0) {
+      if (uploads && uploads.length > 0) {
         setMessages((data) => {
           const messages = data.map((item, i) => {
             if (i === data.length - 2) {
@@ -388,12 +545,13 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
         else if (data.json) text = JSON.stringify(data.json, null, 2);
         else text = JSON.stringify(data, null, 2);
 
-        updateLastMessage(text, data?.chatMessageId, data?.sourceDocuments, data?.fileAnnotations);
+        updateLastMessage(text, data?.chatMessageId, data?.sourceDocuments, data?.fileAnnotations, data?.agentReasoning, data?.action, data.text);
       } else {
-        updateLastMessage('', data?.chatMessageId, data?.sourceDocuments, data?.fileAnnotations);
+        updateLastMessage('', data?.chatMessageId, data?.sourceDocuments, data?.fileAnnotations, data?.agentReasoning, data?.action, data.text);
       }
       setLoading(false);
       setUserInput('');
+      setUploadedFiles([]);
       scrollToBottom();
     }
     if (result.error) {
@@ -403,32 +561,80 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
         handleError(`Error: ${error?.message.replaceAll('Error:', ' ')}`);
         return;
       }
+      if (typeof error === 'string') {
+        handleError(error);
+        return;
+      }
       handleError();
       return;
     }
   };
 
+  const handleActionClick = async (label: string, action: IAction | undefined | null) => {
+    setUserInput(label);
+    setMessages((data) => {
+      const updated = data.map((item, i) => {
+        if (i === data.length - 1) {
+          return { ...item, action: null };
+        }
+        return item;
+      });
+      addChatMessage(updated);
+      return [...updated];
+    });
+    handleSubmit(label, action);
+  };
+
   const clearChat = () => {
     try {
-      localStorage.removeItem(`${props.chatflowid}_EXTERNAL`);
+      removeLocalStorageChatHistory(props.chatflowid);
       setChatId(
         (props.chatflowConfig?.vars as any)?.customerId ? `${(props.chatflowConfig?.vars as any).customerId.toString()}+${uuidv4()}` : uuidv4(),
       );
-      setMessages([
+      setUploadedFiles([]);
+      const messages: MessageType[] = [
         {
           message: props.welcomeMessage ?? defaultWelcomeMessage,
           type: 'apiMessage',
         },
-      ]);
+      ];
+      if (leadsConfig()?.status && !getLocalStorageChatflow(props.chatflowid)?.lead) {
+        messages.push({ message: '', type: 'leadCaptureMessage' });
+      }
+      setMessages(messages);
     } catch (error: any) {
       const errorData = error.response.data || `${error.response.status}: ${error.response.statusText}`;
       console.error(`error: ${errorData}`);
     }
   };
 
+  onMount(() => {
+    if (props.clearChatOnReload) {
+      clearChat();
+      window.addEventListener('beforeunload', clearChat);
+      return () => {
+        window.removeEventListener('beforeunload', clearChat);
+      };
+    }
+  });
+
+  createEffect(() => {
+    if (props.starterPrompts && props.starterPrompts.length > 0) {
+      const prompts = Object.values(props.starterPrompts).map((prompt) => prompt);
+
+      return setStarterPrompts(prompts.filter((prompt) => prompt !== ''));
+    }
+  });
+
   // Auto scroll chat to bottom
   createEffect(() => {
-    if (messages()) scrollToBottom();
+    if (messages()) {
+      if (messages().length > 1) {
+        setTimeout(() => {
+          chatContainer?.scrollTo(0, chatContainer.scrollHeight);
+        }, 400);
+      }
+    }
   });
 
   createEffect(() => {
@@ -437,28 +643,41 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
 
   // eslint-disable-next-line solid/reactivity
   createEffect(async () => {
-    const chatMessage = localStorage.getItem(`${props.chatflowid}_EXTERNAL`);
-    if (chatMessage) {
-      const objChatMessage = JSON.parse(chatMessage);
-      setChatId(objChatMessage.chatId);
-      const loadedMessages = objChatMessage.chatHistory.map((message: MessageType) => {
-        const chatHistory: MessageType = {
-          messageId: message?.messageId,
-          message: message.message,
-          type: message.type,
-        };
-        if (message.sourceDocuments) chatHistory.sourceDocuments = message.sourceDocuments;
-        if (message.fileAnnotations) chatHistory.fileAnnotations = message.fileAnnotations;
-        if (message.fileUploads) chatHistory.fileUploads = message.fileUploads;
-        return chatHistory;
-      });
-      setMessages([...loadedMessages]);
+    const chatMessage = getLocalStorageChatflow(props.chatflowid);
+    if (chatMessage && Object.keys(chatMessage).length) {
+      if (chatMessage.chatId) setChatId(chatMessage.chatId);
+      const savedLead = chatMessage.lead;
+      if (savedLead) {
+        setIsLeadSaved(!!savedLead);
+        setLeadEmail(savedLead.email);
+      }
+      const loadedMessages: MessageType[] =
+        chatMessage?.chatHistory?.length > 0
+          ? chatMessage.chatHistory?.map((message: MessageType) => {
+              const chatHistory: MessageType = {
+                messageId: message?.messageId,
+                message: message.message,
+                type: message.type,
+                rating: message.rating,
+              };
+              if (message.sourceDocuments) chatHistory.sourceDocuments = message.sourceDocuments;
+              if (message.fileAnnotations) chatHistory.fileAnnotations = message.fileAnnotations;
+              if (message.fileUploads) chatHistory.fileUploads = message.fileUploads;
+              if (message.agentReasoning) chatHistory.agentReasoning = message.agentReasoning;
+              if (message.action) chatHistory.action = message.action;
+              return chatHistory;
+            })
+          : [{ message: props.welcomeMessage ?? defaultWelcomeMessage, type: 'apiMessage' }];
+
+      const filteredMessages = loadedMessages.filter((message) => message.message !== '' && message.type !== 'leadCaptureMessage');
+      setMessages([...filteredMessages]);
     }
 
     // Determine if particular chatflow is available for streaming
     const { data } = await isStreamAvailableQuery({
       chatflowid: props.chatflowid,
       apiHost: props.apiHost,
+      onRequest: props.onRequest,
     });
 
     if (data) {
@@ -469,11 +688,12 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
     const result = await getChatbotConfig({
       chatflowid: props.chatflowid,
       apiHost: props.apiHost,
+      onRequest: props.onRequest,
     });
 
     if (result.data) {
       const chatbotConfig = result.data;
-      if (chatbotConfig.starterPrompts) {
+      if ((!props.starterPrompts || props.starterPrompts?.length === 0) && chatbotConfig.starterPrompts) {
         const prompts: string[] = [];
         Object.getOwnPropertyNames(chatbotConfig.starterPrompts).forEach((key) => {
           prompts.push(chatbotConfig.starterPrompts[key].prompt);
@@ -486,6 +706,12 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
       }
       if (chatbotConfig.uploads) {
         setUploadsConfig(chatbotConfig.uploads);
+      }
+      if (chatbotConfig.leads) {
+        setLeadsConfig(chatbotConfig.leads);
+        if (chatbotConfig.leads?.status && !getLocalStorageChatflow(props.chatflowid)?.lead) {
+          setMessages((prevMessages) => [...prevMessages, { message: '', type: 'leadCaptureMessage' }]);
+        }
       }
     }
 
@@ -501,11 +727,16 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
 
     socket.on('sourceDocuments', updateLastMessageSourceDocuments);
 
+    socket.on('agentReasoning', updateLastMessageAgentReasoning);
+
+    socket.on('action', updateLastMessageAction);
+
     socket.on('token', updateLastMessage);
 
     // eslint-disable-next-line solid/reactivity
     return () => {
       setUserInput('');
+      setUploadedFiles([]);
       setLoading(false);
       setMessages([
         {
@@ -561,7 +792,7 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
         data: base64data,
         preview: '../assets/wave-sound.jpg',
         type: 'audio',
-        name: 'audio.wav',
+        name: `audio_${Date.now()}.wav`,
         mime: mimeType,
       };
       setPreviews((prevPreviews) => [...prevPreviews, upload]);
@@ -579,6 +810,18 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
         }
       });
     }
+    if (uploadsConfig() && uploadsConfig()?.isFileUploadAllowed && uploadsConfig()?.fileUploadSizeAndTypes) {
+      const fileExt = file.name.split('.').pop();
+      if (fileExt) {
+        uploadsConfig()?.fileUploadSizeAndTypes.map((allowed) => {
+          if (allowed.fileTypes.length === 1 && allowed.fileTypes[0] === '*') {
+            acceptFile = true;
+          } else if (allowed.fileTypes.includes(`.${fileExt}`)) {
+            acceptFile = true;
+          }
+        });
+      }
+    }
     if (!acceptFile) {
       alert(`Cannot upload file. Kindly check the allowed file types and maximum allowed size.`);
     }
@@ -591,9 +834,19 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
       return;
     }
     const filesList = [];
+    const uploadedFiles = [];
     for (const file of files) {
       if (isFileAllowedForUpload(file) === false) {
         return;
+      }
+      // Only add files
+      if (
+        !uploadsConfig()
+          ?.imgUploadSizeAndTypes.map((allowed) => allowed.fileTypes)
+          .join(',')
+          .includes(file.type)
+      ) {
+        uploadedFiles.push(file);
       }
       const reader = new FileReader();
       const { name } = file;
@@ -618,11 +871,12 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
     }
 
     const newFiles = await Promise.all(filesList);
+    setUploadedFiles(uploadedFiles);
     setPreviews((prevPreviews) => [...prevPreviews, ...(newFiles as FilePreview[])]);
   };
 
   const handleDrag = (e: DragEvent) => {
-    if (uploadsConfig()?.isImageUploadAllowed) {
+    if (uploadsConfig()?.isImageUploadAllowed || uploadsConfig()?.isFileUploadAllowed) {
       e.preventDefault();
       e.stopPropagation();
       if (e.type === 'dragenter' || e.type === 'dragover') {
@@ -634,16 +888,26 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
   };
 
   const handleDrop = async (e: InputEvent | DragEvent) => {
-    if (!uploadsConfig()?.isImageUploadAllowed) {
+    if (!uploadsConfig()?.isImageUploadAllowed && !uploadsConfig()?.isFileUploadAllowed) {
       return;
     }
     e.preventDefault();
     setIsDragActive(false);
     const files = [];
+    const uploadedFiles = [];
     if (e.dataTransfer && e.dataTransfer.files.length > 0) {
       for (const file of e.dataTransfer.files) {
         if (isFileAllowedForUpload(file) === false) {
           return;
+        }
+        // Only add files
+        if (
+          !uploadsConfig()
+            ?.imgUploadSizeAndTypes.map((allowed) => allowed.fileTypes)
+            .join(',')
+            .includes(file.type)
+        ) {
+          uploadedFiles.push(file);
         }
         const reader = new FileReader();
         const { name } = file;
@@ -674,6 +938,7 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
       }
 
       const newFiles = await Promise.all(files);
+      setUploadedFiles(uploadedFiles);
       setPreviews((prevPreviews) => [...prevPreviews, ...(newFiles as FilePreview[])]);
     }
 
@@ -734,6 +999,19 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
     stopAudioRecording(addRecordingToPreviews);
   };
 
+  const getInputDisabled = (): boolean => {
+    const messagesArray = messages();
+    const disabled =
+      loading() ||
+      !props.chatflowid ||
+      (leadsConfig()?.status && !isLeadSaved()) ||
+      (messagesArray[messagesArray.length - 1].action && Object.keys(messagesArray[messagesArray.length - 1].action as any).length > 0);
+    if (disabled) {
+      return true;
+    }
+    return false;
+  };
+
   createEffect(
     // listen for changes in previews
     on(previews, (uploads) => {
@@ -750,6 +1028,38 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
       };
     }),
   );
+
+  const previewDisplay = (item: FilePreview) => {
+    if (item.mime.startsWith('image/')) {
+      return (
+        <button
+          class="group w-12 h-12 flex items-center justify-center relative rounded-[10px] overflow-hidden transition-colors duration-200"
+          onClick={() => handleDeletePreview(item)}
+        >
+          <img class="w-full h-full bg-cover" src={item.data as string} />
+          <span class="absolute hidden group-hover:flex items-center justify-center z-10 w-full h-full top-0 left-0 bg-black/10 rounded-[10px] transition-colors duration-200">
+            <TrashIcon />
+          </span>
+        </button>
+      );
+    } else if (item.mime.startsWith('audio/')) {
+      return (
+        <div
+          class={`inline-flex basis-auto flex-grow-0 flex-shrink-0 justify-between items-center rounded-xl h-12 p-1 mr-1 bg-gray-500`}
+          style={{
+            width: `${chatContainer ? (botProps.isFullPage ? chatContainer?.offsetWidth / 4 : chatContainer?.offsetWidth / 2) : '200'}px`,
+          }}
+        >
+          <audio class="block bg-cover bg-center w-full h-full rounded-none text-transparent" controls src={item.data as string} />
+          <button class="w-7 h-7 flex items-center justify-center bg-transparent p-1" onClick={() => handleDeletePreview(item)}>
+            <TrashIcon color="white" />
+          </button>
+        </div>
+      );
+    } else {
+      return <FilePreview item={item} onDelete={() => handleDeletePreview(item)} />;
+    }
+  };
 
   return (
     <>
@@ -768,18 +1078,18 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
             onDrop={handleDrop}
           />
         )}
-        {isDragActive() && uploadsConfig()?.isImageUploadAllowed && (
+        {isDragActive() && (uploadsConfig()?.isImageUploadAllowed || uploadsConfig()?.isFileUploadAllowed) && (
           <div
             class="absolute top-0 left-0 bottom-0 right-0 flex flex-col items-center justify-center bg-black/60 backdrop-blur-sm text-white z-40 gap-2 border-2 border-dashed"
             style={{ 'border-color': props.bubbleBackgroundColor }}
           >
             <h2 class="text-xl font-semibold">Drop here to upload</h2>
-            <For each={uploadsConfig()?.imgUploadSizeAndTypes}>
+            <For each={[...(uploadsConfig()?.imgUploadSizeAndTypes || []), ...(uploadsConfig()?.fileUploadSizeAndTypes || [])]}>
               {(allowed) => {
                 return (
                   <>
                     <span>{allowed.fileTypes?.join(', ')}</span>
-                    <span>Max Allowed Size: {allowed.maxUploadSize} MB</span>
+                    {allowed.maxUploadSize && <span>Max Allowed Size: {allowed.maxUploadSize} MB</span>}
                   </>
                 );
               }}
@@ -854,6 +1164,27 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
                         avatarSrc={props.botMessage?.avatarSrc}
                         chatFeedbackStatus={chatFeedbackStatus()}
                         fontSize={props.fontSize}
+                        isLoading={loading() && index() === messages().length - 1}
+                        showAgentMessages={props.showAgentMessages}
+                        handleActionClick={(label, action) => handleActionClick(label, action)}
+                      />
+                    )}
+                    {message.type === 'leadCaptureMessage' && leadsConfig()?.status && !getLocalStorageChatflow(props.chatflowid)?.lead && (
+                      <LeadCaptureBubble
+                        message={message}
+                        chatflowid={props.chatflowid}
+                        chatId={chatId()}
+                        apiHost={props.apiHost}
+                        backgroundColor={props.botMessage?.backgroundColor}
+                        textColor={props.botMessage?.textColor}
+                        fontSize={props.fontSize}
+                        showAvatar={props.botMessage?.showAvatar}
+                        avatarSrc={props.botMessage?.avatarSrc}
+                        leadsConfig={leadsConfig()}
+                        sendButtonColor={props.textInput?.sendButtonColor}
+                        isLeadSaved={isLeadSaved()}
+                        setIsLeadSaved={setIsLeadSaved}
+                        setLeadEmail={setLeadEmail}
                       />
                     )}
                     {message.type === 'userMessage' && loading() && index() === messages().length - 1 && <LoadingBubble />}
@@ -889,43 +1220,21 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
           <Show when={messages().length === 1}>
             <Show when={starterPrompts().length > 0}>
               <div class="w-full flex flex-row flex-wrap px-5 py-[10px] gap-2">
-                <For each={[...starterPrompts()]}>{(key) => <StarterPromptBubble prompt={key} onPromptClick={() => promptClick(key)} />}</For>
+                <For each={[...starterPrompts()]}>
+                  {(key) => (
+                    <StarterPromptBubble
+                      prompt={key}
+                      onPromptClick={() => promptClick(key)}
+                      starterPromptFontSize={botProps.starterPromptFontSize} // Pass it here as a number
+                    />
+                  )}
+                </For>
               </div>
             </Show>
           </Show>
           <Show when={previews().length > 0}>
             <div class="w-full flex items-center justify-start gap-2 px-5 pt-2 border-t border-[#eeeeee]">
-              <For each={[...previews()]}>
-                {(item) => (
-                  <>
-                    {item.mime.startsWith('image/') ? (
-                      <button
-                        class="group w-12 h-12 flex items-center justify-center relative rounded-[10px] overflow-hidden transition-colors duration-200"
-                        onClick={() => handleDeletePreview(item)}
-                      >
-                        <img class="w-full h-full bg-cover" src={item.data as string} />
-                        <span class="absolute hidden group-hover:flex items-center justify-center z-10 w-full h-full top-0 left-0 bg-black/10 rounded-[10px] transition-colors duration-200">
-                          <TrashIcon />
-                        </span>
-                      </button>
-                    ) : (
-                      <div
-                        class={`inline-flex basis-auto flex-grow-0 flex-shrink-0 justify-between items-center rounded-xl h-12 p-1 mr-1 bg-gray-500`}
-                        style={{
-                          width: `${
-                            chatContainer ? (botProps.isFullPage ? chatContainer?.offsetWidth / 4 : chatContainer?.offsetWidth / 2) : '200'
-                          }px`,
-                        }}
-                      >
-                        <audio class="block bg-cover bg-center w-full h-full rounded-none text-transparent" controls src={item.data as string} />
-                        <button class="w-7 h-7 flex items-center justify-center bg-transparent p-1" onClick={() => handleDeletePreview(item)}>
-                          <TrashIcon color="white" />
-                        </button>
-                      </div>
-                    )}
-                  </>
-                )}
-              </For>
+              <For each={[...previews()]}>{(item) => <>{previewDisplay(item)}</>}</For>
             </div>
           </Show>
           <div class="w-full px-5 pt-2 pb-1">
@@ -984,28 +1293,31 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
                 textColor={props.textInput?.textColor}
                 placeholder={props.textInput?.placeholder}
                 sendButtonColor={props.textInput?.sendButtonColor}
+                maxChars={props.textInput?.maxChars}
+                maxCharsWarningMessage={props.textInput?.maxCharsWarningMessage}
+                autoFocus={props.textInput?.autoFocus}
                 fontSize={props.fontSize}
-                disabled={loading()}
+                disabled={getInputDisabled()}
                 defaultValue={userInput()}
                 onSubmit={handleSubmit}
                 uploadsConfig={uploadsConfig()}
                 setPreviews={setPreviews}
                 onMicrophoneClicked={onMicrophoneClicked}
                 handleFileChange={handleFileChange}
+                sendMessageSound={props.textInput?.sendMessageSound}
+                sendSoundLocation={props.textInput?.sendSoundLocation}
               />
             )}
           </div>
-          <Badge badgeBackgroundColor={props.badgeBackgroundColor} poweredByTextColor={props.poweredByTextColor} botContainer={botContainer} />
+          <Badge
+            footer={props.footer}
+            badgeBackgroundColor={props.badgeBackgroundColor}
+            poweredByTextColor={props.poweredByTextColor}
+            botContainer={botContainer}
+          />
         </div>
       </div>
       {sourcePopupOpen() && <Popup isOpen={sourcePopupOpen()} value={sourcePopupSrc()} onClose={() => setSourcePopupOpen(false)} />}
     </>
   );
 };
-
-// type BottomSpacerProps = {
-//   ref: HTMLDivElement | undefined;
-// };
-// const BottomSpacer = (props: BottomSpacerProps) => {
-//   return <div ref={props.ref} class="w-full h-32" />;
-// };
